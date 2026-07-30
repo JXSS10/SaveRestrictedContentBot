@@ -119,6 +119,80 @@ def _build_reply_markup(source_message: Message):
     return InlineKeyboardMarkup(buttons) if buttons else None
 
 
+# Chats where the bot cannot resend media via file_id (truly restricted content).
+# Once a file_id send fails for a chat, we skip trying it again for that chat to
+# avoid wasting an API round-trip per message during a batch.
+FILE_ID_FAILED_CHATS = set()
+
+
+def _get_file_id_from_msg(msg: Message, msg_type: str):
+    """Extract the file_id string from a message based on its type."""
+    try:
+        if msg_type == "Document":
+            return msg.document.file_id
+        elif msg_type == "Video":
+            return msg.video.file_id
+        elif msg_type == "Animation":
+            return msg.animation.file_id
+        elif msg_type == "Sticker":
+            return msg.sticker.file_id
+        elif msg_type == "Voice":
+            return msg.voice.file_id
+        elif msg_type == "Audio":
+            return msg.audio.file_id
+        elif msg_type == "Photo":
+            return msg.photo.file_id
+    except AttributeError:
+        return None
+    return None
+
+
+async def _send_media_via_file_id(client: Client, msg: Message, msg_type: str,
+                                  target_chat: int, reply_to, caption, caption_entities,
+                                  reply_markup, effective_thumb):
+    """Try to resend media through the bot using the original file_id (zero bandwidth
+    through the host — Telegram transfers the file server-side). Returns True on success,
+    False if the bot cannot access the file (e.g. genuinely restricted content) so the
+    caller can fall back to the download+upload path."""
+    file_id = _get_file_id_from_msg(msg, msg_type)
+    if not file_id:
+        return False
+
+    # Common kwargs for media that supports a caption.
+    caption_kwargs = {
+        'caption': caption,
+        'caption_entities': caption_entities,
+        'reply_to_message_id': reply_to,
+        'reply_markup': reply_markup,
+        'parse_mode': enums.ParseMode.HTML,
+    }
+    try:
+        if msg_type == "Document":
+            await client.send_document(target_chat, document=file_id, thumb=effective_thumb, **caption_kwargs)
+        elif msg_type == "Video":
+            await client.send_video(target_chat, video=file_id, duration=msg.video.duration,
+                                    width=msg.video.width, height=msg.video.height,
+                                    thumb=effective_thumb, **caption_kwargs)
+        elif msg_type == "Audio":
+            await client.send_audio(target_chat, audio=file_id, thumb=effective_thumb, **caption_kwargs)
+        elif msg_type == "Animation":
+            await client.send_animation(target_chat, animation=file_id, **caption_kwargs)
+        elif msg_type == "Voice":
+            await client.send_voice(target_chat, voice=file_id, **caption_kwargs)
+        elif msg_type == "Photo":
+            await client.send_photo(target_chat, photo=file_id, **caption_kwargs)
+        elif msg_type == "Sticker":
+            # Stickers do not accept caption/parse_mode.
+            await client.send_sticker(target_chat, sticker=file_id,
+                                      reply_to_message_id=reply_to, reply_markup=reply_markup)
+        else:
+            return False
+        return True
+    except Exception as e:
+        logger.debug(f"file_id send failed for {msg_type}: {e}")
+        return False
+
+
 async def _process_reference(client: Client, message: Message, reference: dict):
     if not await db.is_user_exist(message.from_user.id):
         await db.add_user(message.from_user.id, message.from_user.first_name)
@@ -766,6 +840,49 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
                                           parse_mode=enums.ParseMode.HTML)
             return {"status": "error"}
+
+    # --------------------------------------------------------------
+    # Zero-bandwidth fast path: try to resend the media by file_id
+    # through the bot. Telegram transfers the file server-side, so
+    # nothing is downloaded/uploaded through the host (saves ~2x the
+    # file size in bandwidth per file). Falls back to the download +
+    # upload path below only when the bot cannot access the file
+    # (truly restricted content). The source chat is remembered on
+    # failure so we don't retry the fast path for every message in a
+    # batch from the same restricted chat.
+    # --------------------------------------------------------------
+    if chatid not in FILE_ID_FAILED_CHATS:
+        fi_caption = msg.caption if msg.caption else None
+        fi_caption_entities = msg.caption_entities if fi_caption and msg.caption_entities else None
+        fi_caption = _apply_word_rules(fi_caption or "", delete_words, replace_words) or None
+        if fi_caption and fi_caption_entities and fi_caption != (msg.caption or ""):
+            fi_caption_entities = None
+
+        fi_thumb = None
+        fi_thumb_dir = None
+        if msg_type in ("Document", "Video", "Audio"):
+            custom_thumb = await db.get_thumbnail(message.from_user.id)
+            if custom_thumb:
+                fi_thumb_dir = f"downloads/{message.id}_thumb"
+                fi_thumb = await _get_effective_thumbnail_path(message.from_user.id, client, fi_thumb_dir)
+
+        sent_ok = await _send_media_via_file_id(
+            client, msg, msg_type, target_chat, reply_to,
+            fi_caption, fi_caption_entities, _build_reply_markup(msg), fi_thumb,
+        )
+
+        if fi_thumb_dir and os.path.exists(fi_thumb_dir):
+            try:
+                shutil.rmtree(fi_thumb_dir)
+            except:
+                pass
+
+        if sent_ok:
+            return {"status": "sent"}
+
+        # Bot can't resend this chat's content via file_id — remember it
+        # and fall through to the download + upload path.
+        FILE_ID_FAILED_CHATS.add(chatid)
 
     smsg = await client.send_message(message.chat.id, '**__Downloading 🚀__**', reply_to_message_id=message.id)
     
